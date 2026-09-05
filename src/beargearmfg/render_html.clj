@@ -1,208 +1,217 @@
 (ns beargearmfg.render-html
   "Build-time HTML renderer for `docs/samples/operator-console.html`.
 
-  Closes flagship checklist item 2 (com-junkawasaki/root ADR-2607189300):
-  this repo previously had NO demo page and no generator at all. This
-  namespace drives the REAL actor stack -- `beargearmfg.operation`
-  (a langgraph-clj StateGraph) -> `beargearmfg.governor` ->
-  `beargearmfg.phase` -> `beargearmfg.store` -- through a scenario
-  adapted from this repo's own `beargearmfg.sim` demo driver
-  (`clojure -M:dev:run`, confirmed BEFORE writing this file to produce a
-  sensible ledger against the real seeded ids `batch-001`..`batch-003`
-  and `mach-001`/`grind-002`), and renders the resulting store + ledger.
+  Drives the REAL BearGearOperationActor (`beargearmfg.operation/build`
+  -> a compiled langgraph-clj StateGraph) over the REAL seeded store
+  (`beargearmfg.store/sample-data!`), through the REAL Bearings, Gears
+  and Driving Elements Plant Operations Governor
+  (`beargearmfg.governor/check`) and the REAL rollout phase gate
+  (`beargearmfg.phase/gate`), driven with `langgraph.graph/run*` exactly
+  the way this repo's own `beargearmfg.sim` demo driver
+  (`clojure -M:dev:run`) does -- then renders whatever those actually
+  produced. Nothing on the page is written by hand:
 
-  EVERY number, id, disposition and hold reason on the page is read back
-  out of real actor output (`store/ledger`, `store/all-batches`,
-  `store/all-equipment`, `store/maintenance-history`,
-  `store/shipment-history`, `store/safety-concerns`) or derived from the
-  real policy data (`phase/phases`, `governor/allowed-ops`). Nothing on
-  the page is a hand-typed literal describing behaviour.
+    - every table row is read back out of the store after the run
+      (`store/ledger`, `store/all-batches`, `store/all-equipment`,
+      `store/all-maintenance`, `store/shipment`,
+      `store/safety-concerns`, `store/maintenance-history`,
+      `store/shipment-history`),
+    - every HARD-hold rule name and every violation detail string is the
+      governor's own `:violations` entry off the ledger fact -- never a
+      literal in this namespace,
+    - the phase gate table is derived from `beargearmfg.phase/phases`,
+      and the governor configuration / ground-truth bound tables from
+      `beargearmfg.governor` and `beargearmfg.registry` public vars.
 
-  The scenario deliberately produces BOTH dispositions:
-    - 1 phase-3 auto-commit + 4 human-approved commits (the clean path), and
-    - 11 HARD governor holds covering all 12 distinct governor rules
-      (`:unknown-op` and `:equipment-control-blocked` fire together on the
-      same request, since an unrecognized op yields a `:noop` proposal
-      effect). A HARD hold never reaches a human -- the page derives that
-      claim per row from the absence of an `:approval-requested` fact in
-      that run's own audit trail, rather than asserting it in prose.
+  The ONLY hand-written content on the page is each scenario's
+  `:exercises` sentence -- a static description of the fixed op-gate
+  contract this repo's governor and phase gate implement, i.e.
+  documentation of behaviour that is fixed in code, not runtime
+  telemetry. It is labelled as such at its definition site below.
 
-  DETERMINISM: this actor's store needs no clock -- no fact it writes
-  carries a timestamp -- so the page contains no generation time and no
-  random id, and two consecutive runs are byte-identical. Verify with:
+  Subject provenance (the demo may not invent subjects): every batch and
+  equipment id driven below is either seeded by `store/sample-data!`
+  (`batch-001` `batch-002` `batch-003` `mach-001` `grind-002` -- verified
+  against the seed before this file was written) or created by an intake
+  op inside this demo itself -- `batch-004` exists only because the
+  `t01` `:log-production-batch` commit created it -- and every `mnt-*` /
+  `ship-*` / `concern-*` subject is the draft record that its own op
+  registers via `beargearmfg.registry`.
 
-      S=$(mktemp -d)
-      clojure -M:dev:render-html \"$S/a.html\"
-      clojure -M:dev:render-html \"$S/b.html\"
-      cmp \"$S/a.html\" \"$S/b.html\"
+  Fields rendered are only fields the domain model actually carries. In
+  particular `:approved-by` is NOT rendered on a committed shipment /
+  maintenance record: `beargearmfg.operation`'s `:request-approval` node
+  puts the approver on the record's `:payload`, while
+  `store/commit-record!` persists `:value` -- so the approver is shown
+  from the run timeline (where it is real), not from the stored record
+  (where it does not exist).
 
-  `-main` REFUSES to write the file if the resulting ledger contains zero
-  `:governor-hold` facts (or zero `:committed` facts), so the
-  both-dispositions requirement is a build-time invariant rather than a
-  convention (precedent: cloud-itonami-isic-2513).
+  Deterministic: no clock, no randomness, no network, no timestamp in
+  the page content. Every set-valued var is sorted before rendering (a
+  set has no order, and an unsorted render would not be byte-stable).
+  Re-running writes a byte-identical file.
 
-  Usage: `clojure -M:dev:render-html [out-file]`
-  (default `docs/samples/operator-console.html`)."
-  (:require [clojure.string :as str]
-            [jp-go-dds.skin :as skin]
+  Run: `clojure -M:dev:render-html [out-file]`
+  (default out-file `docs/samples/operator-console.html`)."
+  (:require [jp-go-dds.skin]
+            [clojure.string :as str]
             [langgraph.graph :as g]
             [beargearmfg.governor :as governor]
-            [beargearmfg.operation :as operation]
+            [beargearmfg.operation :as op]
             [beargearmfg.phase :as phase]
+            [beargearmfg.registry :as registry]
             [beargearmfg.store :as store]))
 
+;; ----------------------------- the run -----------------------------
+
 (def ^:private coordinator
-  "The operator identity every run below is executed as -- the same
-  shape `beargearmfg.sim` uses (`:phase 3` = supervised-auto)."
-  {:actor-id "coord-1" :actor-role :plant-coordinator :phase 3})
+  {:actor-id "coord-1" :actor-role :plant-coordinator :phase phase/default-phase})
 
-;; ----------------------------- scenario -----------------------------
+(def ^:private scenarios
+  "One entry = one coordination request driven through the real actor.
+  `:approval`, when present, is the human decision handed back to the
+  paused graph (`interrupt-before #{:request-approval}`).
 
-(def ^:private scenario
-  "One entry = one real actor run. `:approve?` true means a human plant
-  supervisor / shipping approver resumes the paused graph with
-  `{:approval {:status :approved}}` -- which only ever happens for runs
-  the governor actually escalated. A HARD hold is never resumable, so
-  `:approve?` is irrelevant there (no `:request-approval` node is
-  reached at all)."
-  [;; ---- clean paths -------------------------------------------------
-   {:tid "s01" :approve? false
-    :label "生産バッチ記録 batch-001 (正常な patch)"
-    :request {:op :log-production-batch :effect :propose :subject "batch-001"
-              :patch {:product-type :ball-bearing :tolerance-test-um 8.0
-                      :defect-rate-percent 0.8 :last-assessed "2026-07-14"}}}
-   {:tid "s02" :approve? true
-    :label "保守作業予定 mnt-1 / mach-001 (検証・登録済みの精密機械加工ライン)"
+  NOTE on `:exercises`: this string is the ONE piece of hand-written
+  content on the generated page. It describes the FIXED op-gate
+  contract (`beargearmfg.governor`'s twelve HARD rules + the
+  confidence/high-stakes gate, and `beargearmfg.phase`'s rollout gate)
+  that this repo implements in code -- it is documentation of fixed
+  behaviour, not a claim about what happened at run time. Everything
+  the page reports as having HAPPENED (verdict, disposition, rule
+  names, detail text, counts, stored records) is read back off the real
+  run."
+  [{:tid "t01"
+    :exercises "Intake of a NEW production batch. Governor-clean, and :log-production-batch is the only op in phase 3's :auto set -> auto-commit with no human in the loop. batch-004 exists for the rest of this page only because this op created it."
+    :request {:op :log-production-batch :effect :propose :subject "batch-004"
+              :patch {:product-type :helical-gear
+                      :model "HG-M3-40T"
+                      :tolerance-test-um 18.0
+                      :quantity-units 900.0
+                      :defect-rate-percent 1.1
+                      :last-assessed "2026-07-20"}}}
+
+   {:tid "t02"
+    :exercises "Maintenance window against a verified + registered precision-machining line. Never auto-eligible at any phase (a maintenance window means real downtime and the equipment ends up touched) -> escalates; the human plant supervisor approves."
     :request {:op :schedule-maintenance :effect :propose :subject "mnt-1"
-              :value {:equipment-id "mach-001" :maintenance-type :spindle-inspection
-                      :scheduled-date "2026-08-01" :actuate-equipment? false}}}
-   {:tid "s03" :approve? true
-    :label "安全懸念報告 concern-1 / mach-001 (常に high-stakes)"
+              :value {:equipment-id "mach-001"
+                      :maintenance-type :spindle-inspection
+                      :scheduled-date "2026-08-01"
+                      :actuate-equipment? false}}
+    :approval {:status :approved :by "coord-1"}}
+
+   {:tid "t03"
+    :exercises "Safety concern. Always :coordination/safety-concern stake, so the governor escalates regardless of confidence; the human approves. A concern may be raised about any equipment, verified or not -- safety reporting is never blocked on an administrative technicality."
     :request {:op :flag-safety-concern :effect :propose :subject "concern-1"
               :value {:equipment-id "mach-001" :severity :moderate
-                      :description "研削油漏れの異常兆候、主軸振動増加"}}}
-   {:tid "s04" :approve? true
-    :label "出荷調整 ship-1 / batch-001 (生産数量に十分な余裕)"
+                      :description "研削油漏れの異常兆候、主軸振動増加"}}
+    :approval {:status :approved :by "coord-1"}}
+
+   {:tid "t04"
+    :exercises "Shipment against a verified + registered batch with headroom. Escalates; the human shipping approver approves and the batch's own shipped-units advances."
     :request {:op :coordinate-shipment :effect :propose :subject "ship-1"
               :value {:batch-id "batch-001" :units 500.0
-                      :destination "buyer-yard-north"}}}
-   {:tid "s05" :approve? true
-    :label "出荷調整 ship-4 / batch-002 (記録済み生産数量ちょうどに一致)"
-    :request {:op :coordinate-shipment :effect :propose :subject "ship-4"
-              :value {:batch-id "batch-002" :units 50.0
-                      :destination "buyer-yard-west"}}}
+                      :destination "buyer-yard-north"}}
+    :approval {:status :approved :by "coord-1"}}
 
-   ;; ---- HARD holds ---------------------------------------------------
-   {:tid "s06" :approve? true
-    :label "request の :effect が :propose ではない (配線不良・侵害された呼び出し元)"
-    :request {:op :log-production-batch :effect :direct-write :subject "batch-001"
-              :patch {:product-type :ball-bearing}}}
-   {:tid "s07" :approve? true
-    :label "許可リスト外の op (機械加工ラインの直接操作を要求)"
-    :request {:op :actuate-machining-line :effect :propose :subject "batch-001"}}
-   {:tid "s08" :approve? true
-    :label "保守作業予定 mnt-2 / grind-002 (未検証・未登録の研削ライン)"
-    :request {:op :schedule-maintenance :effect :propose :subject "mnt-2"
-              :value {:equipment-id "grind-002" :maintenance-type :calibration
-                      :scheduled-date "2026-08-01" :actuate-equipment? false}}}
-   {:tid "s09" :approve? true
-    :label "出荷調整 ship-2 / batch-003 (未検証・未登録のバッチ)"
+   {:tid "t05"
+    :exercises "A governor-clean shipment that a person VETOES. Distinct from a HARD hold: the governor cleared it, a human declined it. The batch's shipped-units does NOT advance."
     :request {:op :coordinate-shipment :effect :propose :subject "ship-2"
-              :value {:batch-id "batch-003" :units 100.0
-                      :destination "buyer-yard-south"}}}
-   {:tid "s10" :approve? true
-    :label "出荷調整 ship-3 / batch-002 (記録済み生産数量を超過)"
+              :value {:batch-id "batch-001" :units 100.0
+                      :destination "buyer-yard-west"}}
+    :approval {:status :rejected :by "coord-1"}}
+
+   {:tid "t06"
+    :exercises "Shipment against batch-004 -- the batch t01 just created, which carries no verified?/registered? ground truth of its own. The governor re-derives that from the batch record, never from the advisor's rationale. HARD hold."
     :request {:op :coordinate-shipment :effect :propose :subject "ship-3"
+              :value {:batch-id "batch-004" :units 10.0
+                      :destination "buyer-yard-north"}}
+    :approval {:status :approved :by "coord-1"}}
+
+   {:tid "t07"
+    :exercises "Shipment whose claimed units would push batch-002 past its own recorded production quantity. The governor independently recomputes headroom from the batch's own permanent fields. HARD hold."
+    :request {:op :coordinate-shipment :effect :propose :subject "ship-4"
               :value {:batch-id "batch-002" :units 100.0
                       :destination "buyer-yard-east"}}}
-   {:tid "s11" :approve? true
-    :label "保守作業予定 mnt-3 / mach-001 が設備の直接操作(actuate)を要求"
+
+   {:tid "t08"
+    :exercises "Maintenance against the seeded grinding line, which is neither inspected nor on file. HARD hold."
+    :request {:op :schedule-maintenance :effect :propose :subject "mnt-2"
+              :value {:equipment-id "grind-002"
+                      :maintenance-type :calibration
+                      :scheduled-date "2026-08-05"
+                      :actuate-equipment? false}}}
+
+   {:tid "t09"
+    :exercises "A maintenance proposal that tries to ACTUATE the machining line rather than draft a window. Permanent scope boundary -- no phase and no human approval can override it, so it never reaches a human even though an approval was offered. HARD hold."
     :request {:op :schedule-maintenance :effect :propose :subject "mnt-3"
               :value {:equipment-id "mach-001" :maintenance-type :force-run
-                      :scheduled-date "2026-09-01" :actuate-equipment? true}}}
-   {:tid "s12" :approve? true
-    :label "保守作業予定 mnt-1 の二重登録"
+                      :scheduled-date "2026-09-01"
+                      :actuate-equipment? true}}
+    :approval {:status :approved :by "coord-1"}}
+
+   {:tid "t10"
+    :exercises "The SAME maintenance window as t02, scheduled twice. Guarded off a dedicated :scheduled? fact, never a :status value. HARD hold."
     :request {:op :schedule-maintenance :effect :propose :subject "mnt-1"
-              :value {:equipment-id "mach-001" :maintenance-type :spindle-inspection
-                      :scheduled-date "2026-08-01" :actuate-equipment? false}}}
-   {:tid "s13" :approve? true
-    :label "生産バッチ記録 batch-001 に捏造された product-type"
-    :request {:op :log-production-batch :effect :propose :subject "batch-001"
+              :value {:equipment-id "mach-001"
+                      :maintenance-type :spindle-inspection
+                      :scheduled-date "2026-08-01"
+                      :actuate-equipment? false}}}
+
+   {:tid "t11"
+    :exercises "A batch patch declaring a product type outside the closed known set for bearings/gears/driving elements. HARD hold."
+    :request {:op :log-production-batch :effect :propose :subject "batch-003"
               :patch {:product-type :unobtainium}}}
-   {:tid "s14" :approve? true
-    :label "生産バッチ記録 batch-001 に物理的に不可能な公差試験値"
-    :request {:op :log-production-batch :effect :propose :subject "batch-001"
+
+   {:tid "t12"
+    :exercises "A batch patch with a dimensional-tolerance reading far outside any physically plausible bearing/gear measurement. HARD hold."
+    :request {:op :log-production-batch :effect :propose :subject "batch-003"
               :patch {:tolerance-test-um 999999.0}}}
-   {:tid "s15" :approve? true
-    :label "生産バッチ記録 batch-001 に物理的に不可能な不良率"
-    :request {:op :log-production-batch :effect :propose :subject "batch-001"
+
+   {:tid "t13"
+    :exercises "A batch patch claiming a defect rate above 100% -- a batch cannot reject more than its own output. HARD hold."
+    :request {:op :log-production-batch :effect :propose :subject "batch-003"
               :patch {:defect-rate-percent 999.0}}}
-   {:tid "s16" :approve? true
-    :label "生産バッチ記録 batch-001 が公差等級認証の自己発行を要求"
+
+   {:tid "t14"
+    :exercises "A patch trying to self-issue a bearing/gear tolerance-class certification mark (ISO 492 / AGMA / ISO 1328). Authority this actor never holds -- permanent, so the offered approval is never reached. HARD hold."
     :request {:op :log-production-batch :effect :propose :subject "batch-001"
-              :patch {:issue-certification? true}}}])
+              :patch {:issue-certification? true}}
+    :approval {:status :approved :by "coord-1"}}
 
-(defn- exec! [actor tid request]
-  (g/run* actor {:request request :context coordinator} {:thread-id tid}))
+   {:tid "t15"
+    :exercises "A mis-wired caller whose own request :effect is not :propose -- evaluated before anything else, so a compromised caller can never reach a commit path. HARD hold."
+    :request {:op :log-production-batch :effect :direct-write :subject "batch-001"
+              :patch {:product-type :ball-bearing}}}
 
-(defn- approve! [actor tid]
-  (g/run* actor {:approval {:status :approved :by (:actor-id coordinator)}}
-          {:thread-id tid :resume? true}))
+   {:tid "t16"
+    :exercises "An op outside the closed allowlist. Both the op allowlist and the proposal-effect allowlist reject it, so two independent HARD rules fire on one request. HARD hold."
+    :request {:op :actuate-machining-line :effect :propose :subject "batch-001"}}])
 
-(defn- run-one
-  "Executes one scenario entry against the REAL compiled actor and
-  returns the entry enriched with that run's own final graph state. If
-  the graph escalated (paused at `:request-approval`) and the entry asks
-  for approval, it is resumed -- a HARD hold never gets here, because
-  `beargearmfg.operation`'s `:decide` node routes it straight to `:hold`."
-  [actor {:keys [tid request approve?] :as entry}]
-  (let [first-state (:state (exec! actor tid request))
-        escalated? (= :escalate (:disposition first-state))
-        resumed (when (and escalated? approve?) (:state (approve! actor tid)))]
-    (assoc entry
-           :escalated? escalated?
-           :resumed? (some? resumed)
-           :state (or resumed first-state))))
+(defn- drive!
+  "Runs one scenario through the real compiled graph and returns the
+  scenario enriched with what the graph actually did."
+  [actor {:keys [tid request approval] :as scenario}]
+  (let [r1 (g/run* actor {:request request :context coordinator} {:thread-id tid})
+        paused? (= :interrupted (:status r1))
+        r2 (when (and approval paused?)
+             (g/run* actor {:approval approval} {:thread-id tid :resume? true}))
+        final (:state (or r2 r1))
+        audit (:audit final [])]
+    (assoc scenario
+           :verdict (:verdict final)
+           :paused? paused?
+           :escalation (first (filter #(= :approval-requested (:t %)) audit))
+           :human (when r2 (:status approval))
+           :disposition (:disposition final))))
 
 (defn run-demo!
-  "Seeds a fresh store with this repo's own `store/sample-data!` and runs
-  the whole `scenario` through one compiled `beargearmfg.operation`
-  actor, in order. Returns `{:db <store> :runs [<enriched entry> ..]}`.
-  `mapv` guarantees left-to-right execution, which matters: `ship-4`
-  must commit before `ship-3` is judged, and `mnt-1` must commit before
-  its double-registration is refused."
+  "Seeds a MemStore, builds the real actor, drives every scenario
+  through `langgraph.graph/run*`. Returns {:db store :runs [..]}."
   []
   (let [db (-> (store/mem-store) (store/sample-data!))
-        actor (operation/build db)]
-    {:db db :runs (mapv (partial run-one actor) scenario)}))
-
-;; ----------------------------- derived views -----------------------------
-
-(defn- audit-of [run] (get-in run [:state :audit] []))
-
-(defn- fact-of [run t] (first (filter #(= t (:t %)) (audit-of run))))
-
-(defn- human-offered?
-  "Did this run ever produce an `:approval-requested` fact? A HARD hold
-  never does -- that is what 'never reaches a human' means here, read off
-  the run's own audit trail rather than asserted."
-  [run]
-  (some? (fact-of run :approval-requested)))
-
-(defn- disposition-of
-  "One of :hard-hold / :human-approved / :auto-commit / :awaiting-approval
-  / :rejected, derived from the run's own audit + final disposition."
-  [run]
-  (cond
-    (fact-of run :governor-hold)      :hard-hold
-    (fact-of run :approval-rejected)  :rejected
-    (:resumed? run)                   :human-approved
-    (:escalated? run)                 :awaiting-approval
-    (= :commit (get-in run [:state :disposition])) :auto-commit
-    :else                             :other))
-
-(defn- never-auto-at-any-phase? [op]
-  (every? (fn [[_ {:keys [auto]}]] (not (contains? auto op))) phase/phases))
+        actor (op/build db)]
+    {:db db :runs (mapv #(drive! actor %) scenarios)}))
 
 ;; ----------------------------- html helpers -----------------------------
 
@@ -210,292 +219,393 @@
   (-> (str v)
       (str/replace "&" "&amp;")
       (str/replace "<" "&lt;")
-      (str/replace ">" "&gt;")))
+      (str/replace ">" "&gt;")
+      (str/replace "\"" "&quot;")))
 
-(defn- lbl [v] (if (keyword? v) (name v) (str v)))
-
-(defn- fmt [v] (if (nil? v) "—" (str v)))
-
-(defn- basis-str [basis]
-  (if (seq basis) (str/join ", " (map lbl basis)) "—"))
-
-(defn- td [& cells] (str "        <tr>" (str/join (map #(str "<td>" % "</td>") cells)) "</tr>"))
+(defn- fmt
+  "Render a stored value, or an em dash when the domain model has no
+  value for that field on that record."
+  [v]
+  (if (nil? v) "—" (esc v)))
 
 (defn- code [v] (str "<code>" (esc v) "</code>"))
 
-(defn- yes-no [b ok-text warn-text]
-  (if b
-    (str "<span class=\"ok\">" ok-text "</span>")
-    (str "<span class=\"critical\">" warn-text "</span>")))
+(defn- num-cell [v]
+  (if (nil? v) "—" (str "<span class=\"num\">" (esc v) "</span>")))
+
+(defn- flag [v]
+  (if (true? v)
+    "<span class=\"ok\">true</span>"
+    (str "<span class=\"muted\">" (if (nil? v) "—" (esc v)) "</span>")))
+
+(defn- yes-no [b]
+  (if b "<span class=\"ok\">yes</span>" "<span class=\"err\">no</span>"))
+
+(defn- codes
+  "Render a SEQUENCE of keywords in the order the code produced it --
+  used for `:basis`, whose order is the governor's own evaluation
+  order."
+  [coll]
+  (str/join " " (map code coll)))
+
+(defn- kw-codes
+  "Render a SET of keywords. Sorted, because a set has no order and an
+  unsorted render would make the output non-deterministic."
+  [coll]
+  (str/join " " (map code (sort-by str coll))))
+
+(defn- tr [& cells] (str "<tr>" (apply str (map #(str "<td>" % "</td>") cells)) "</tr>"))
 
 (defn- table [headers rows]
-  (str "    <table>\n"
-       "      <thead><tr>" (str/join (map #(str "<th>" % "</th>") headers)) "</tr></thead>\n"
-       "      <tbody>\n"
-       (str/join "\n" rows) "\n"
-       "      </tbody>\n"
-       "    </table>\n"))
+  (str "<table><thead><tr>"
+       (apply str (map #(str "<th>" (esc %) "</th>") headers))
+       "</tr></thead><tbody>\n"
+       (str/join "\n" rows)
+       "\n</tbody></table>"))
 
-(defn- section [title lead body]
-  (str "  <section class=\"card\">\n"
-       "    <h2>" title "</h2>\n"
-       (when lead (str "    <p class=\"muted\">" lead "</p>\n"))
-       body
-       "  </section>\n"))
+(defn- card [title note body]
+  (str "<section class=\"card\"><h2>" (esc title) "</h2>"
+       (when note (str "<p class=\"muted\">" note "</p>"))
+       body "</section>"))
 
-;; ----------------------------- row builders -----------------------------
+;; ----------------------------- sections -----------------------------
 
-(defn- last-fact-for [ledger subject]
-  (last (filter #(= subject (:subject %)) ledger)))
+(defn- ledger-of [db] (vec (store/ledger db)))
 
-(defn- last-status [ledger subject]
-  (let [f (last-fact-for ledger subject)]
-    (case (:t f)
-      :committed  "<span class=\"ok\">committed</span>"
-      :governor-hold (str "<span class=\"critical\">HARD hold · "
-                          (esc (basis-str (:basis f))) "</span>")
-      :approval-rejected "<span class=\"warn\">approval rejected</span>"
-      "<span class=\"muted\">直接の操作なし</span>")))
+(defn- holds [db]
+  (filterv #(= :governor-hold (:t %)) (ledger-of db)))
 
-(defn- batch-row [ledger {:keys [id product-type model tolerance-test-um quantity-units
-                                 shipped-units defect-rate-percent verified? registered?
-                                 last-assessed]}]
-  (td (code id) (esc (lbl product-type)) (esc model)
-      (str "<span class=\"num\">" (esc (fmt tolerance-test-um)) "</span>")
-      (str "<span class=\"num\">" (esc (fmt quantity-units)) "</span>")
-      (str "<span class=\"num\">" (esc (fmt shipped-units)) "</span>")
-      (str "<span class=\"num\">" (esc (fmt defect-rate-percent)) "</span>")
-      (yes-no (and verified? registered?) "検証済・登録済" "未検証/未登録")
-      (esc (fmt last-assessed))
-      (last-status ledger id)))
+(defn- summary-section [db runs]
+  (let [led (ledger-of db)
+        n (fn [t] (count (filter #(= t (:t %)) led)))]
+    (card "Run summary"
+          (str "Every number below is a count over the actor's own append-only ledger "
+               "after driving " (count runs) " requests through "
+               (code "beargearmfg.operation/build") ".")
+          (str
+           (table ["Measure" "Count"]
+                  [(tr "requests driven" (num-cell (count runs)))
+                   (tr "ledger facts" (num-cell (count led)))
+                   (tr "commits" (num-cell (n :committed)))
+                   (tr "governor HARD holds" (num-cell (n :governor-hold)))
+                   (tr "human rejections on the ledger" (num-cell (n :approval-rejected)))
+                   (tr "human approvals handed back to the graph"
+                       (num-cell (count (filter #(= :approved (:human %)) runs))))
+                   (tr "human vetoes handed back to the graph"
+                       (num-cell (count (filter #(= :rejected (:human %)) runs))))
+                   (tr "maintenance drafts committed"
+                       (num-cell (count (store/maintenance-history db))))
+                   (tr "shipment drafts committed"
+                       (num-cell (count (store/shipment-history db))))
+                   (tr "safety concerns logged"
+                       (num-cell (count (store/safety-concerns db))))])
+           "<p class=\"muted\"><code>:approval-granted</code> is emitted to the graph's in-memory "
+           "<code>:audit</code> channel only — <code>beargearmfg.operation</code> never appends it "
+           "to the store ledger, so it is not a fact this page counts. An approved request is "
+           "visible as the <code>:committed</code> fact it produced.</p>"))))
 
-(defn- equipment-row [{:keys [id kind verified? registered? last-maintenance-date
-                              last-scheduled-maintenance-date]}]
-  (td (code id) (esc (lbl kind))
-      (yes-no (and verified? registered?) "検証済・登録済" "未検証/未登録")
-      (esc (fmt last-maintenance-date))
-      (esc (fmt last-scheduled-maintenance-date))))
+(defn- verdict-cell [{:keys [verdict]}]
+  (cond
+    (nil? verdict) "<span class=\"muted\">—</span>"
+    (:hard? verdict)
+    (str "<span class=\"critical\">HARD</span> "
+         (codes (map :rule (:violations verdict))))
+    (:escalate? verdict)
+    (str "<span class=\"warn\">escalate</span>"
+         (when (:high-stakes? verdict) " <span class=\"muted\">high-stakes</span>"))
+    :else (str "<span class=\"ok\">clean</span> <span class=\"muted\">conf "
+               (esc (:confidence verdict)) "</span>")))
 
-(defn- gate-row [runs op]
-  (let [ph (:phase coordinator)
-        {:keys [writes auto]} (get phase/phases ph)
-        observed (->> runs
-                      (filter #(= op (get-in % [:request :op])))
-                      (map disposition-of)
-                      distinct
-                      (map name)
-                      sort)]
-    (td (code op)
-        (cond
-          (not (contains? writes op)) "<span class=\"critical\">phase 3: 書き込み不可</span>"
-          (contains? auto op)         "<span class=\"ok\">governor がクリーンなら自動コミット</span>"
-          :else                       "<span class=\"warn\">phase 3: 人間の承認が必要</span>")
-        (if (never-auto-at-any-phase? op)
-          "<span class=\"critical\">いいえ — どの phase でも自動化されない</span>"
-          "<span class=\"ok\">はい (phase 3)</span>")
-        (if (seq observed)
-          (esc (str/join ", " observed))
-          "<span class=\"muted\">この実行では未使用</span>"))))
+(defn- human-cell [{:keys [approval human paused?]}]
+  (cond
+    (= :approved human) "<span class=\"ok\">approved</span>"
+    (= :rejected human) "<span class=\"err\">vetoed</span>"
+    (and approval (not paused?))
+    "<span class=\"muted\">never offered (no interrupt)</span>"
+    :else "<span class=\"muted\">—</span>"))
 
-(defn- run-row [idx {:keys [label request state] :as run}]
-  (let [d (disposition-of run)
-        hold (fact-of run :governor-hold)
-        verdict (:verdict state)]
-    (td (str "<span class=\"num\">" (inc idx) "</span>")
-        (esc label)
-        (code (:op request))
-        (code (:subject request))
-        (case d
-          :hard-hold          "<span class=\"critical\">HARD hold</span>"
-          :human-approved     "<span class=\"ok\">人間が承認 → commit</span>"
-          :auto-commit        "<span class=\"ok\">phase-3 自動 commit</span>"
-          :awaiting-approval  "<span class=\"warn\">承認待ち</span>"
-          :rejected           "<span class=\"warn\">承認却下</span>"
-          (str "<span class=\"muted\">" (esc (name d)) "</span>"))
-        (if (human-offered? run)
-          "<span class=\"warn\">はい (承認要求を発行)</span>"
-          "<span class=\"critical\">いいえ (承認要求すら発行されない)</span>")
-        (esc (basis-str (:basis hold)))
-        (str "<span class=\"num\">" (esc (fmt (:confidence verdict))) "</span>"))))
+(defn- disposition-cell [{:keys [disposition]}]
+  (case disposition
+    :commit "<span class=\"ok\">commit</span>"
+    :hold "<span class=\"err\">hold</span>"
+    :escalate "<span class=\"warn\">escalate</span>"
+    (str "<span class=\"muted\">" (fmt disposition) "</span>")))
 
-(defn- rule-rows
-  "Every distinct HARD rule this run actually reached, with its own count
-  and the governor's own `:detail` string for the first occurrence."
-  [ledger]
-  (let [vs (mapcat :violations (filter #(= :governor-hold (:t %)) ledger))
-        by-rule (group-by :rule vs)]
-    (for [rule (sort-by name (keys by-rule))
-          :let [hits (get by-rule rule)]]
-      (td (code rule)
-          (str "<span class=\"num\">" (count hits) "</span>")
-          (esc (:detail (first hits)))))))
+(defn- timeline-section [runs]
+  (card "Request timeline"
+        (str "One row = one <code>langgraph.graph/run*</code> over the compiled actor — the same "
+             "call this repo's own <code>beargearmfg.sim</code> demo driver makes. The governor "
+             "column is the verdict map the governor itself returned; the human column is the "
+             "decision handed back to the graph while it was paused at " (code ":request-approval")
+             ". Only <em>What this exercises</em> is prose.")
+        (table ["Thread" "Op" "Subject" "Governor" "Human" "Final" "What this exercises"]
+               (for [{:keys [tid request escalation exercises] :as r} runs]
+                 (tr (code tid)
+                     (code (:op request))
+                     (code (:subject request))
+                     (verdict-cell r)
+                     (human-cell r)
+                     (str (disposition-cell r)
+                          (when-let [reason (:reason escalation)]
+                            (str " <span class=\"muted\">after escalation "
+                                 (code reason) "</span>")))
+                     (str "<span class=\"muted\">" (esc exercises) "</span>"))))))
 
-(defn- ledger-row [{:keys [t op subject basis summary confidence]}]
-  (td (case t
-        :committed "<span class=\"ok\">committed</span>"
-        :governor-hold "<span class=\"critical\">governor-hold</span>"
-        (str "<span class=\"warn\">" (esc (lbl t)) "</span>"))
-      (code op) (code subject)
-      (esc (basis-str basis))
-      (esc (or summary "—"))
-      (str "<span class=\"num\">" (esc (fmt confidence)) "</span>")))
+(defn- holds-section [db]
+  (let [hs (holds db)]
+    (card "Governor HARD holds"
+          (str "Each row is one violation on a <code>:governor-hold</code> fact on the append-only "
+               "ledger. The rule name and the detail text are the governor's own "
+               (code ":violations") " entries — this page holds no rule text of its own. A HARD "
+               "hold is never overridable: no phase and no human approval can lift it.")
+          (table ["Rule" "Op" "Subject" "Confidence" "Governor's own detail"]
+                 (for [h hs
+                       v (:violations h)]
+                   (tr (str "<span class=\"critical\">" (esc (:rule v)) "</span>")
+                       (code (:op h))
+                       (code (:subject h))
+                       (num-cell (:confidence h))
+                       (esc (:detail v))))))))
 
-(defn- maintenance-draft-row [r]
-  (td (code (get r "record_id"))
-      (esc (get r "kind"))
-      (code (get r "maintenance_id"))
-      (code (get r "equipment_id"))
-      (yes-no (get r "immutable") "immutable" "mutable")))
+(defn- rejections-section [db]
+  (let [rs (filterv #(= :approval-rejected (:t %)) (ledger-of db))]
+    (when (seq rs)
+      (card "Human vetoes"
+            (str "A governor-clean proposal a person declined. Written to the ledger by the same "
+                 (code ":hold") " node, but with basis " (code ":approver-rejected") " — not a "
+                 "compliance violation. The SSoT is not mutated either way.")
+            (table ["Op" "Subject" "Basis" "Confidence"]
+                   (for [r rs]
+                     (tr (code (:op r)) (code (:subject r))
+                         (codes (:basis r)) (num-cell (:confidence r)))))))))
 
-(defn- shipment-draft-row [r]
-  ;; A shipment-coordination draft carries no equipment_id at all --
-  ;; `beargearmfg.registry/register-shipment` never touches equipment.
-  (td (code (get r "record_id"))
-      (esc (get r "kind"))
-      (code (get r "shipment_id"))
-      (yes-no (get r "immutable") "immutable" "mutable")))
+(defn- phase-section []
+  (let [ph phase/default-phase
+        {:keys [label writes auto]} (get phase/phases ph)]
+    (card (str "Rollout phase gate — phase " ph " (" label ")")
+          (str "Derived from " (code "beargearmfg.phase/phases") ". A governor HOLD always stays a "
+               "HOLD; an op that may write but is not auto-eligible escalates to a human even when "
+               "the governor is clean. " (code ":schedule-maintenance") " is absent from every "
+               "phase's " (code ":auto") " set permanently, not as a rollout milestone still to "
+               "come.")
+          (table ["Op" "May write in this phase" "May auto-commit when governor-clean"]
+                 (for [o (sort-by str governor/allowed-ops)]
+                   (tr (code o)
+                       (if (contains? writes o)
+                         "<span class=\"ok\">yes</span>"
+                         "<span class=\"err\">no — HOLD (:phase-disabled)</span>")
+                       (if (contains? auto o)
+                         "<span class=\"ok\">yes</span>"
+                         "<span class=\"warn\">no — always human approval</span>")))))))
 
-(defn- concern-row [{:keys [id equipment-id severity description]}]
-  (td (code id) (code equipment-id) (esc (lbl severity)) (esc description)))
+(defn- governor-section []
+  (card "Governor configuration"
+        (str "Read straight off the public vars of " (code "beargearmfg.governor") ". Sets are "
+             "sorted for a stable render — the governor itself imposes no order on them.")
+        (table ["Setting" "Value"]
+               [(tr "confidence floor" (code governor/confidence-floor))
+                (tr "allowed ops" (kw-codes governor/allowed-ops))
+                (tr "allowed proposal effects" (kw-codes governor/allowed-proposal-effects))
+                (tr "always-human stakes" (kw-codes governor/high-stakes))])))
+
+(defn- bounds-section []
+  (card "Independent ground-truth bounds"
+        (str "The values " (code "beargearmfg.registry") " uses to re-derive the truth itself, "
+             "rather than believing the advisor's rationale.")
+        (table ["Bound" "Value"]
+               [(tr "valid product types" (kw-codes registry/valid-product-types))
+                (tr "dimensional-tolerance test (µm)"
+                    (str (code registry/tolerance-test-um-min) " … "
+                         (code registry/tolerance-test-um-max)))
+                (tr "defect rate (%)"
+                    (str (code registry/defect-rate-min-percent) " … "
+                         (code registry/defect-rate-max-percent)))])))
+
+(defn- last-fact-for [led subject]
+  (last (filter #(= subject (:subject %)) led)))
+
+(defn- subject-status [led subject]
+  (let [f (last-fact-for led subject)]
+    (cond
+      (nil? f) "<span class=\"muted\">no ledger activity</span>"
+      (= :committed (:t f)) "<span class=\"ok\">committed</span>"
+      (= :approval-rejected (:t f)) "<span class=\"err\">vetoed by approver</span>"
+      (= :governor-hold (:t f))
+      (str "<span class=\"critical\">HARD hold</span> " (codes (:basis f)))
+      :else (str "<span class=\"muted\">" (esc (:t f)) "</span>"))))
+
+(defn- remaining
+  "Headroom left on a batch, using the SAME `0.0` default
+  `beargearmfg.registry` itself applies when it recomputes headroom for
+  a batch that carries no `:shipped-units` of its own yet."
+  [b]
+  (let [q (:quantity-units b) s (:shipped-units b 0.0)]
+    (when (and (number? q) (number? s)) (- (double q) (double s)))))
+
+(defn- batches-section [db]
+  (let [led (ledger-of db)]
+    (card "Production batches"
+          (str "Read back from " (code "beargearmfg.store/all-batches") " after the run. "
+               (code "batch-001") " " (code "batch-002") " " (code "batch-003")
+               " are seeded by " (code "store/sample-data!") "; " (code "batch-004")
+               " exists because the <code>t01</code> intake op committed it. A field the record "
+               "does not carry shows as —. " (code "ready?") " is "
+               (code "registry/batch-ready?") " — the independent verified? AND registered? gate "
+               "the governor re-derives, never the advisor's self-report.")
+          (table ["Batch" "Product type" "Model" "Tolerance (µm)" "Quantity (units)"
+                  "Shipped (units)" "Remaining" "Defect rate (%)" "verified?" "registered?"
+                  "ready?" "Last assessed" "Ledger status"]
+                 (for [b (store/all-batches db)]
+                   (tr (code (:id b)) (fmt (:product-type b)) (fmt (:model b))
+                       (num-cell (:tolerance-test-um b)) (num-cell (:quantity-units b))
+                       (num-cell (:shipped-units b)) (num-cell (remaining b))
+                       (num-cell (:defect-rate-percent b))
+                       (flag (:verified? b)) (flag (:registered? b))
+                       (yes-no (registry/batch-ready? b))
+                       (fmt (:last-assessed b))
+                       (subject-status led (:id b))))))))
+
+(defn- equipment-section [db]
+  (card "Machining / grinding line equipment"
+        (str "Read back from " (code "beargearmfg.store/all-equipment") ". Equipment ids are never "
+             "a request " (code ":subject") " in this domain (a maintenance draft id is), so no "
+             "ledger-status column is shown for them — "
+             (code ":last-scheduled-maintenance-date") " is the field the commit path actually "
+             "writes onto an equipment record.")
+        (table ["Unit" "Kind" "verified?" "registered?" "ready?" "Last maintenance"
+                "Last scheduled maintenance" "Maintenance drafts on file"]
+               (for [e (store/all-equipment db)]
+                 (tr (code (:id e)) (fmt (:kind e))
+                     (flag (:verified? e)) (flag (:registered? e))
+                     (yes-no (registry/equipment-ready? e))
+                     (fmt (:last-maintenance-date e))
+                     (fmt (:last-scheduled-maintenance-date e))
+                     (num-cell (count (filter #(= (:id e) (:equipment-id %))
+                                              (store/all-maintenance db)))))))))
+
+(defn- maintenance-section [db]
+  (let [ms (store/all-maintenance db)]
+    (card "Maintenance schedule drafts"
+          (str "Committed drafts from " (code "beargearmfg.store/all-maintenance") ". The "
+               "maintenance number is minted by "
+               (code "beargearmfg.registry/register-maintenance")
+               " at commit time. Nothing here actuates any equipment — "
+               (code ":actuate-equipment? true") " is a permanent HARD block.")
+          (if (seq ms)
+            (table ["Draft" "Equipment" "Type" "Scheduled date" "actuate-equipment?"
+                    "scheduled?" "Maintenance number"]
+                   (for [m ms]
+                     (tr (code (:id m)) (code (:equipment-id m)) (fmt (:maintenance-type m))
+                         (fmt (:scheduled-date m)) (flag (:actuate-equipment? m))
+                         (flag (:scheduled? m)) (fmt (:maintenance-number m)))))
+            "<p class=\"muted\">none committed in this run</p>"))))
+
+(defn- shipments-section [db]
+  (let [hist (store/shipment-history db)
+        ships (keep #(store/shipment db (get % "shipment_id")) hist)]
+    (card "Shipment coordination drafts"
+          (str "Committed drafts, joined from " (code "beargearmfg.store/shipment-history")
+               " back to each stored shipment record. This is a draft a coordinator keeps — it "
+               "dispatches no freight carrier.")
+          (if (seq ships)
+            (table ["Draft" "Batch" "Units" "Destination" "Shipment number"]
+                   (for [s ships]
+                     (tr (code (:id s)) (code (:batch-id s)) (num-cell (:units s))
+                         (fmt (:destination s)) (fmt (:shipment-number s)))))
+            "<p class=\"muted\">none committed in this run</p>"))))
+
+(defn- concerns-section [db]
+  (let [cs (store/safety-concerns db)]
+    (card "Safety concerns"
+          (str "The append-only safety-concern log ("
+               (code "beargearmfg.store/safety-concerns")
+               "). A concern may be raised against any equipment, verified or not — it is never "
+               "blocked on an administrative technicality, and it always requires a human.")
+          (if (seq cs)
+            (table ["Concern" "Equipment" "Severity" "Description"]
+                   (for [c cs]
+                     (tr (code (:id c)) (code (:equipment-id c)) (fmt (:severity c))
+                         (fmt (:description c)))))
+            "<p class=\"muted\">none flagged in this run</p>"))))
+
+(defn- ledger-section [db]
+  (card "Audit ledger (append-only)"
+        (str "The full ledger, in append order, exactly as "
+             (code "beargearmfg.store/ledger") " returns it.")
+        (table ["#" "Fact" "Op" "Subject" "Actor" "Disposition" "Basis"]
+               (map-indexed
+                (fn [i f]
+                  (tr (num-cell (inc i))
+                      (let [cls (case (:t f)
+                                  :committed "ok"
+                                  :governor-hold "critical"
+                                  :approval-rejected "err"
+                                  "muted")]
+                        (str "<span class=\"" cls "\">" (esc (:t f)) "</span>"))
+                      (code (:op f)) (code (:subject f)) (fmt (:actor f))
+                      (fmt (:disposition f)) (codes (:basis f))))
+                (ledger-of db)))))
 
 ;; ----------------------------- page -----------------------------
 
 (defn render
-  "Renders the whole operator-console document from `{:db .. :runs ..}`
-  as produced by `run-demo!` (or any other real scenario run through the
-  same actor)."
+  "The whole page, from the post-run store and the run log."
   [{:keys [db runs]}]
-  (let [ledger (vec (store/ledger db))
-        holds (filterv #(= :governor-hold (:t %)) ledger)
-        commits (filterv #(= :committed (:t %)) ledger)
-        ph (:phase coordinator)
-        phase-label (get-in phase/phases [ph :label])]
-    (str
-     "<!doctype html>\n"
-     "<html lang=\"ja\"><head><meta charset=\"utf-8\">"
-     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-     "<title>cloud-itonami-isic-2814 · 軸受・歯車・伝動要素 プラント運用 オペレーターコンソール</title>"
-     "<style>\n" (skin/dds+skin) "\n</style></head><body>\n"
-     "<header class=\"bar\">\n"
-     "  <h1>軸受・歯車・歯車装置・伝動要素の製造 (ISIC 2814) — オペレーターコンソール</h1>\n"
-     "</header>\n"
-     "<p><span class=\"badge\">read-only sample</span> "
-     "<span class=\"badge\">governor-gated</span> "
-     "<span class=\"badge\">phase " ph " · " (esc phase-label) "</span> "
-     "<span class=\"badge\">保守作業予定はどの phase でも自動化されない</span></p>\n"
-     "<p class=\"muted\">このページは <code>beargearmfg.render-html</code> "
-     "(<code>clojure -M:dev:render-html</code>) がビルド時に生成する。"
-     "表示される数値・id・判定・保留理由はすべて実際の actor 実行"
-     "(<code>beargearmfg.operation</code> の StateGraph → "
-     "<code>beargearmfg.governor</code> → <code>beargearmfg.phase</code> → "
-     "<code>beargearmfg.store</code>)の出力を読み戻したもので、手書きの文言ではない。"
-     "この actor が書く fact には時刻が一切入らないため、同じ seed からの再生成は"
-     "バイト単位で同一になる。</p>\n"
-     "<main>\n"
-
-     (section "生産バッチ (SSoT)"
-              (str "seed は <code>beargearmfg.store/sample-data!</code>。"
-                   "「出荷済」はこの実行で実際にコミットされた出荷調整の反映後の値。")
-              (table ["バッチ" "製品種別" "型式" "公差試験(µm)" "生産数量" "出荷済"
-                      "不良率(%)" "検証/登録" "最終評価日" "最終操作の判定"]
-                     (map (partial batch-row ledger) (store/all-batches db))))
-
-     (section "設備 (SSoT)"
-              (str "「予定済み保守日」は <code>:maintenance/schedule</code> の"
-                   "コミットが設備側に書き戻したもの。未検証・未登録の設備には"
-                   "保守作業予定を立てられない(HARD)。")
-              (table ["設備" "種別" "検証/登録" "最終保守日" "予定済み保守日"]
-                     (map equipment-row (store/all-equipment db))))
-
-     (section "操作ゲート (Bearings, Gears and Driving Elements Plant Operations Governor)"
-              (str "許可リストは <code>beargearmfg.governor/allowed-ops</code>、"
-                   "phase 別の書き込み/自動化可否は <code>beargearmfg.phase/phases</code> "
-                   "から導出している(この表に手書きの方針文は無い)。"
-                   "HARD 違反は上書きできない — phase でも人間の承認でも覆らない。")
-              (table ["op" (str "phase " ph " の扱い") "どこかの phase で自動化されるか"
-                      "この実行で観測された判定"]
-                     (map (partial gate-row runs) (sort-by name governor/allowed-ops))))
-
-     (section "シナリオ実行 (この実行の全 run)"
-              (str "1 行 = 1 グラフ実行。「人間に到達したか」はその run 自身の audit に "
-                   "<code>:approval-requested</code> fact があるかで判定している — "
-                   "HARD hold は <code>:decide</code> ノードから直接 <code>:hold</code> へ"
-                   "分岐するため、承認要求そのものが発行されない。")
-              (table ["#" "シナリオ" "op" "対象" "判定" "人間に到達したか" "HARD 根拠" "confidence"]
-                     (map-indexed run-row runs)))
-
-     (section "発火した governor ルール"
-              (str "この実行で実際に発火した HARD ルールと、governor 自身が書いた "
-                   "<code>:detail</code> 文字列。")
-              (table ["ルール" "件数" "governor の説明 (初出)"] (rule-rows ledger)))
-
-     (section "監査台帳 (append-only)"
-              (str "<code>beargearmfg.store</code> の追記専用台帳。commit ノードと hold "
-                   "ノードだけが書き込む。")
-              (table ["fact" "op" "対象" "根拠" "要約" "confidence"]
-                     (map ledger-row ledger)))
-
-     (section "ドラフト記録 (保守作業予定)"
-              (str "<code>beargearmfg.registry/register-maintenance</code> が構築した"
-                   "ドラフト。設備を実際に操作(actuate)するものではない。")
-              (table ["記録番号" "種別" "保守 id" "設備 id" "不変性"]
-                     (if (seq (store/maintenance-history db))
-                       (map maintenance-draft-row (store/maintenance-history db))
-                       [(td "<span class=\"muted\">なし</span>" "" "" "" "")])))
-
-     (section "ドラフト記録 (出荷調整)"
-              (str "<code>beargearmfg.registry/register-shipment</code> が構築したドラフト。"
-                   "実際の運送手配は行わない。")
-              (table ["記録番号" "種別" "出荷 id" "不変性"]
-                     (if (seq (store/shipment-history db))
-                       (map shipment-draft-row (store/shipment-history db))
-                       [(td "<span class=\"muted\">なし</span>" "" "" "")])))
-
-     (section "安全懸念ログ"
-              (str "安全懸念は常に high-stakes "
-                   "(<code>beargearmfg.governor/high-stakes</code>) で、"
-                   "どの phase でも自動コミットされない。")
-              (table ["id" "設備" "深刻度" "内容"]
-                     (if (seq (store/safety-concerns db))
-                       (map concern-row (store/safety-concerns db))
-                       [(td "<span class=\"muted\">なし</span>" "" "" "")])))
-
-     "</main>\n"
-     "<footer>\n"
-     "  <p>台帳 fact " (count ledger) " 件 · commit " (count commits) " 件 · "
-     "HARD hold " (count holds) " 件 · 保守ドラフト "
-     (count (store/maintenance-history db)) " 件 · 出荷ドラフト "
-     (count (store/shipment-history db)) " 件 · 安全懸念 "
-     (count (store/safety-concerns db)) " 件。</p>\n"
-     "  <p>この actor が行わないこと: 精密機械加工・熱処理・研削設備の直接操作、"
-     "実際の運送手配、軸受・歯車の公差等級認証(ISO 492 / AGMA / ISO 1328 等)の発行。</p>\n"
-     "</footer>\n"
-     "</body></html>\n")))
+  (str "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
+       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+       "<meta name=\"color-scheme\" content=\"light\">"
+       "<title>Operator console — cloud-itonami-isic-2814 (beargearmfg)</title>"
+       "<style>" (jp-go-dds.skin/dds+skin) "</style></head>\n<body>\n"
+       "<header class=\"bar\">"
+       "<span class=\"badge\">ISIC 2814</span>"
+       "<span class=\"badge\">beargearmfg</span>"
+       "<span class=\"badge\">read-only sample</span>"
+       "</header>\n"
+       "<h1>Bearings, gears, gearing &amp; driving elements — plant operations console</h1>"
+       "<p class=\"subtitle\">Governor <code>bearings-gears-plant-operations-governor</code> · actor "
+       (esc (:actor-id coordinator)) " · role " (code (:actor-role coordinator))
+       " · phase " (esc (:phase coordinator))
+       ". Every figure below was produced by driving the real actor graph at build time.</p>\n"
+       "<main>\n"
+       (str/join "\n"
+                 (remove nil?
+                         [(summary-section db runs)
+                          (timeline-section runs)
+                          (holds-section db)
+                          (rejections-section db)
+                          (phase-section)
+                          (governor-section)
+                          (bounds-section)
+                          (batches-section db)
+                          (equipment-section db)
+                          (maintenance-section db)
+                          (shipments-section db)
+                          (concerns-section db)
+                          (ledger-section db)]))
+       "\n</main>\n<footer>"
+       "Generated at build time by <code>beargearmfg.render-html</code> "
+       "(<code>clojure -M:dev:render-html</code>) by driving the real "
+       "<code>beargearmfg.operation</code> actor graph over the real "
+       "<code>beargearmfg.store</code> seed. Deterministic — no clock, no randomness, no network. "
+       "This actor never actuates machining or grinding-line equipment and never issues a "
+       "bearing/gear tolerance-class certification mark. No usage, revenue or performance metric "
+       "is claimed anywhere on this page."
+       "</footer>\n</body>\n</html>\n"))
 
 (defn -main [& args]
   (let [out (or (first args) "docs/samples/operator-console.html")
-        {:keys [db] :as result} (run-demo!)
-        ledger (vec (store/ledger db))
-        holds (count (filter #(= :governor-hold (:t %)) ledger))
-        commits (count (filter #(= :committed (:t %)) ledger))]
-    ;; Build-time invariant, not a convention: a console that shows only
-    ;; one disposition is not evidence that the governor works. Refuse to
-    ;; write the page unless the REAL run produced both.
-    (when (zero? holds)
-      (throw (ex-info (str "refusing to write " out
-                           ": the scenario produced ZERO :governor-hold ledger facts. "
-                           "The operator console must demonstrate at least one HARD hold "
-                           "that never reaches a human.")
-                      {:out out :ledger-facts (count ledger) :holds 0 :commits commits})))
-    (when (zero? commits)
-      (throw (ex-info (str "refusing to write " out
-                           ": the scenario produced ZERO :committed ledger facts. "
-                           "The operator console must also demonstrate a clean/approved path.")
-                      {:out out :ledger-facts (count ledger) :holds holds :commits 0})))
+        {:keys [db runs] :as result} (run-demo!)
+        hs (holds db)]
+    ;; Build-time invariant: a console that shows no real HARD hold is
+    ;; not evidence of a governor. Refuse to write one.
+    (when (empty? hs)
+      (throw (ex-info "no :governor-hold fact on the ledger — refusing to write a console that shows no real hold"
+                      {:ledger-facts (count (store/ledger db))
+                       :requests (count runs)})))
     (let [f (java.io.File. ^String out)]
-      (when-let [parent (.getParentFile f)] (.mkdirs parent))
+      (when-let [p (.getParentFile f)] (.mkdirs p))
       (spit f (render result)))
-    (println "wrote" out "(" (count ledger) "ledger facts,"
-             commits "commits," holds "HARD holds,"
-             (count (store/maintenance-history db)) "maintenance drafts,"
-             (count (store/shipment-history db)) "shipment drafts )")))
+    (println "wrote" out
+             (str "(" (count (store/ledger db)) " ledger facts, "
+                  (count hs) " HARD holds, "
+                  (count runs) " requests)"))))
