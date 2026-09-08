@@ -43,7 +43,7 @@
 
   Usage: `clojure -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [jp-go-dds.skin :as skin]
             [langgraph.graph :as g]
             [beargearmfg.governor :as governor]
