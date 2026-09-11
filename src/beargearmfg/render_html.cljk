@@ -7,7 +7,7 @@
   (a langgraph-clj StateGraph) -> `beargearmfg.governor` ->
   `beargearmfg.phase` -> `beargearmfg.store` -- through a scenario
   adapted from this repo's own `beargearmfg.sim` demo driver
-  (`clojure -M:dev:run`, confirmed BEFORE writing this file to produce a
+  (`kbb -M:dev:run`, confirmed BEFORE writing this file to produce a
   sensible ledger against the real seeded ids `batch-001`..`batch-003`
   and `mach-001`/`grind-002`), and renders the resulting store + ledger.
 
@@ -32,8 +32,8 @@
   random id, and two consecutive runs are byte-identical. Verify with:
 
       S=$(mktemp -d)
-      clojure -M:dev:render-html \"$S/a.html\"
-      clojure -M:dev:render-html \"$S/b.html\"
+      kbb -M:dev:render-html \"$S/a.html\"
+      kbb -M:dev:render-html \"$S/b.html\"
       cmp \"$S/a.html\" \"$S/b.html\"
 
   `-main` REFUSES to write the file if the resulting ledger contains zero
@@ -41,7 +41,7 @@
   both-dispositions requirement is a build-time invariant rather than a
   convention (precedent: cloud-itonami-isic-2513).
 
-  Usage: `clojure -M:dev:render-html [out-file]`
+  Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
   (:require [kotoba.lang.text :as str]
             [jp-go-dds.skin :as skin]
@@ -384,7 +384,7 @@
      "<span class=\"badge\">phase " ph " · " (esc phase-label) "</span> "
      "<span class=\"badge\">保守作業予定はどの phase でも自動化されない</span></p>\n"
      "<p class=\"muted\">このページは <code>beargearmfg.render-html</code> "
-     "(<code>clojure -M:dev:render-html</code>) がビルド時に生成する。"
+     "(<code>kbb -M:dev:render-html</code>) がビルド時に生成する。"
      "表示される数値・id・判定・保留理由はすべて実際の actor 実行"
      "(<code>beargearmfg.operation</code> の StateGraph → "
      "<code>beargearmfg.governor</code> → <code>beargearmfg.phase</code> → "
