@@ -43,7 +43,7 @@
 
   Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
-  (:require [kotoba.lang.text :as str]
+  (:require [kotoba.io :as kio] [kotoba.lang.text :as str]
             [jp-go-dds.skin :as skin]
             [langgraph.graph :as g]
             [beargearmfg.governor :as governor]
@@ -492,8 +492,8 @@
                            ": the scenario produced ZERO :committed ledger facts. "
                            "The operator console must also demonstrate a clean/approved path.")
                       {:out out :ledger-facts (count ledger) :holds holds :commits 0})))
-    (let [f (java.io.File. ^String out)]
-      (when-let [parent (.getParentFile f)] (.mkdirs parent))
+    (let [f (kio/file ^String out)]
+      (when-let [parent (kio/parent-file f)] (kio/mkdirs parent))
       (spit f (render result)))
     (println "wrote" out "(" (count ledger) "ledger facts,"
              commits "commits," holds "HARD holds,"
