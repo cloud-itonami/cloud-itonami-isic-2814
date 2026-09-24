@@ -1,0 +1,32 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README: the ISIC 2814 plant precision-machines, heat-treats and grinds
+;; bearings, gears and driving elements. The robots' physical work: oil
+;; quenching a bearing ring from hardening temperature (the ring's core must
+;; pass the pearlite nose fast enough to harden through), and loading gear
+;; blanks into the gear grinder.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-2814"
+ :cases
+ [{:id :bearing-ring-oil-quench
+   :kind :thermal
+   :procedure "a bearing-steel ring at 840 C is plunged into 60 C quench oil; its mid-wall must fall below 500 C (half wall, symmetric mid-plane)"
+   :params {:conductivity-w-mk 30.0 :density-kg-m3 7800.0 :specific-heat-j-kgk 650.0
+            :t0-c 840.0 :t-hot-c 60.0 :h-front-w-m2k 1500.0 :h-back-w-m2k 0.0
+            :threshold-c 500.0 :threshold-direction :falling :duration-s 120.0 :nodes 5}
+   :sweep {:param :thickness-m :values [0.003 0.005 0.008 0.012 0.018]}
+   :quantity :time-to-threshold-s
+   :limit {:max 15.0 :basis "estimate: time to pass the pearlite nose of a through-hardening bearing steel; the oil's effective h of 1500 W/m2K and the steel's high-temperature properties are estimates"}
+   :boundary {:lo 0.002 :hi 0.03}}
+  {:id :gear-blank-into-grinder
+   :kind :manipulator
+   :procedure "arm lifts a hardened gear blank from the pallet onto the gear grinder's work arbor"
+   :params {:l1-m 0.55 :l2-m 0.50 :m1-kg 7.0 :m2-kg 4.5
+            :from [0.65 0.05] :to [0.30 0.60] :duration-s 2.0 :steps 400}
+   :sweep {:param :payload-kg :values [1.0 2.5 5.0 8.0 12.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 150.0 :basis "estimate: continuous shoulder torque of a ~12 kg-class industrial arm"}
+   :boundary {:lo 0.1 :hi 60.0}}]}
